@@ -63,6 +63,82 @@ osc_progress() {
     fi
 }
 
+# The rc file `shll setup shell` wires for the user's login shell — kept in
+# lockstep with its resolveRcFile: zsh → ${ZDOTDIR:-$HOME}/.zshrc, bash →
+# ~/.bash_profile on macOS and ~/.bashrc elsewhere. Prints nothing for any
+# other shell (shll supports neither, so there is no shll block to precede).
+shll_rc_file() {
+    case "$(basename "${SHELL:-}")" in
+        zsh) printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash)
+            if [ "$(uname -s)" = Darwin ]; then
+                printf '%s\n' "$HOME/.bash_profile"
+            else
+                printf '%s\n' "$HOME/.bashrc"
+            fi
+            ;;
+    esac
+}
+
+# Persist `eval "$(<brew> shellenv)"` in the rc file shll wires, so brew and
+# every brew-installed tool (shll included) resolve in future shells. The
+# line must run BEFORE shll's block: when a `# >>> shll >>>` block (or the
+# legacy `# >>> shll shell-init >>>` one) already exists — a re-run — the
+# line is inserted above it; otherwise it is appended, and the hand-off's
+# `shll setup shell` appends its block after it. Idempotent: an rc file that
+# already mentions `brew shellenv` is left alone. Never fatal: on any write
+# failure (or an unsupported shell) it falls back to printing the line.
+persist_brew_shellenv() {
+    brew_bin=$1
+    line="eval \"\$($brew_bin shellenv)\""
+    rc=$(shll_rc_file)
+
+    if [ -z "$rc" ]; then
+        echo "Homebrew installed. To make brew (and the installed tools) resolvable in future shells,"
+        echo "add this line to your shell rc file:"
+        echo "  $line"
+        return 0
+    fi
+    if [ -f "$rc" ] && grep -q 'brew shellenv' "$rc"; then
+        echo "Homebrew installed; $rc already loads brew shellenv."
+        return 0
+    fi
+
+    comment="# Homebrew (added by the shll installer)"
+    if [ -f "$rc" ] && grep -q -e '^# >>> shll >>>' -e '^# >>> shll shell-init >>>' "$rc"; then
+        # Rewrite through cat > "$rc" (not mv) so a dotfile-manager symlink
+        # and the file's permissions survive.
+        tmp=$(mktemp) || tmp=""
+        if [ -n "$tmp" ] &&
+            awk -v c="$comment" -v l="$line" '
+                !done && /^# >>> shll( shell-init)? >>>/ { print c; print l; print ""; done = 1 }
+                { print }
+            ' "$rc" >"$tmp" &&
+            (cat "$tmp" >"$rc") 2>/dev/null; then
+            rm -f "$tmp"
+            echo "Homebrew installed; added its shellenv line to $rc (above the shll block)."
+            return 0
+        fi
+        [ -n "$tmp" ] && rm -f "$tmp"
+    else
+        # Append (creating the file if absent — `shll setup shell` refuses to
+        # create rc files, so this also unblocks its wiring). Lead with a
+        # newline only when the file doesn't already end in one.
+        lead=""
+        if [ -s "$rc" ] && [ -n "$(tail -c 1 "$rc")" ]; then
+            lead="
+"
+        fi
+        if (printf '%s%s\n%s\n' "$lead" "$comment" "$line" >>"$rc") 2>/dev/null; then
+            echo "Homebrew installed; added its shellenv line to $rc."
+            return 0
+        fi
+    fi
+
+    echo "Homebrew installed, but $rc could not be updated. Add this line to it yourself:" >&2
+    echo "  $line" >&2
+}
+
 # Probe git, curl, and tmux BEFORE the Homebrew step and report every miss at
 # once, each with a per-platform fix command — never fail on the first missing
 # dep. On macOS the git probe is `xcode-select -p`, never `command -v git`:
@@ -222,12 +298,13 @@ main() {
         # run.
         eval "$("$BREW" shellenv)"
 
-        # Kill the brew-not-on-PATH trap for the user's *next* shell too:
-        # brew's shellenv line is the user's to keep (shll shell-setup wires
-        # shll's own init, not brew's).
-        echo "Homebrew installed. To make brew (and the installed tools) resolvable in future shells,"
-        echo "add this line to your shell rc file:"
-        echo "  eval \"\$($BREW shellenv)\""
+        # Kill the brew-not-on-PATH trap for the user's *next* shell too.
+        # `shll setup shell` (run by the hand-off below) writes an
+        # unguarded `eval "$(shll shell-init <shell>)"` into the rc file;
+        # without brew's shellenv ahead of it every new shell fails with
+        # `command not found: shll`. shll setup shell wires shll's own init,
+        # not brew's, so the installer that put brew there persists it.
+        persist_brew_shellenv "$BREW"
     fi
     phase_done "brew bootstrap"
 
