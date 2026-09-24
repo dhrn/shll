@@ -76,9 +76,9 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install tmux
 
-      - name: Start from a user rc with no brew and no shll wiring
+      - name: Start from zsh startup files with no brew and no shll wiring
         run: |
-          rm -f ~/.zshrc
+          rm -f ~/.zshenv ~/.zprofile ~/.zshrc
           printf '# fresh user rc\nalias ll="ls -l"\n' > ~/.zshrc
 
       - name: Run the installer with brew hidden from PATH
@@ -87,14 +87,21 @@ jobs:
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             sh scripts/install.sh run-kit --no-agent-setup
 
-      - name: rc file after install
-        run: cat ~/.zshrc
+      - name: Startup files after install
+        run: |
+          for f in ~/.zshenv ~/.zprofile ~/.zshrc; do
+            echo "== $f"; cat "$f" 2>/dev/null || echo "(absent)"
+          done
 
+      # macOS terminals open login shells, which read .zprofile (where the
+      # installer puts brew's line on macOS); Linux terminals open non-login
+      # ones, which read .zshenv.
       - name: A new terminal resolves shll and rk
         run: |
+          if [ "$RUNNER_OS" = macOS ]; then flags=-il; else flags=-i; fi
           out=$(env -i HOME="$HOME" USER="$USER" TERM=dumb SHELL=/bin/zsh \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-            zsh -i -c 'command -v shll rk && shll version' 2>&1 </dev/null)
+            zsh $flags -c 'command -v shll rk && shll version' 2>&1 </dev/null)
           echo "$out"
           if echo "$out" | grep -q 'command not found'; then
             echo "::error::a new shell hit 'command not found'"; exit 1

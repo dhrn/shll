@@ -63,13 +63,32 @@ osc_progress() {
     fi
 }
 
-# The rc file `shll setup shell` wires for the user's login shell — kept in
-# lockstep with its resolveRcFile: zsh → ${ZDOTDIR:-$HOME}/.zshrc, bash →
-# ~/.bash_profile on macOS and ~/.bashrc elsewhere. Prints nothing for any
-# other shell (shll supports neither, so there is no shll block to precede).
-shll_rc_file() {
+# The startup file brew's shellenv line is persisted in. It must run BEFORE
+# every toolkit block that depends on — or reorders — PATH:
+#   - shll's `# >>> shll >>>` block (`shll setup shell`) calls `shll`, which
+#     lives in the brew prefix;
+#   - run-kit's `# >>> rk tmux guard >>>` block (`rk agent setup`) prepends
+#     its tmux shims dir, and `brew shellenv` ALWAYS prepends brew's bin, so
+#     a shellenv line that runs after the guard puts brew's tmux back in
+#     front of the shim (`rk doctor` FAILs "tmux-guard shim").
+# Hence:
+#   zsh, Linux  → ${ZDOTDIR:-$HOME}/.zshenv — read first by every zsh (login
+#                 or not, interactive or not), where rk writes its guard.
+#   zsh, macOS  → ${ZDOTDIR:-$HOME}/.zprofile — Homebrew's documented spot:
+#                 macOS's /etc/zprofile runs path_helper AFTER .zshenv, which
+#                 would demote brew's bin behind /usr/bin in login shells.
+#   bash        → the file shll wires (resolveRcFile): ~/.bash_profile on
+#                 macOS, ~/.bashrc elsewhere — the same file rk guards.
+# Prints nothing for any other shell (shll supports neither).
+brew_rc_file() {
     case "$(basename "${SHELL:-}")" in
-        zsh) printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        zsh)
+            if [ "$(uname -s)" = Darwin ]; then
+                printf '%s\n' "${ZDOTDIR:-$HOME}/.zprofile"
+            else
+                printf '%s\n' "${ZDOTDIR:-$HOME}/.zshenv"
+            fi
+            ;;
         bash)
             if [ "$(uname -s)" = Darwin ]; then
                 printf '%s\n' "$HOME/.bash_profile"
@@ -80,50 +99,57 @@ shll_rc_file() {
     esac
 }
 
-# Persist `eval "$(<brew> shellenv)"` in the rc file shll wires, so brew and
-# every brew-installed tool (shll included) resolve in future shells. The
-# line must run BEFORE shll's block: when a `# >>> shll >>>` block (or the
-# legacy `# >>> shll shell-init >>>` one) already exists — a re-run — the
-# line is inserted above it; otherwise it is appended, and the hand-off's
-# `shll setup shell` appends its block after it. Idempotent: an rc file that
-# already mentions `brew shellenv` is left alone. Never fatal: on any write
-# failure (or an unsupported shell) it falls back to printing the line.
+# Persist `eval "$(<brew> shellenv)"` (see brew_rc_file for where and why), so
+# brew and every brew-installed tool (shll included) resolve in future
+# shells. When a shll or rk tmux-guard block already exists in that file — a
+# re-run — the line is inserted above the first of them; otherwise it is
+# appended, and the hand-off's `shll install` (shll setup shell, rk agent
+# setup) appends its blocks after it. Idempotent: a file that already
+# mentions `brew shellenv` is left alone. Never fatal: on any write failure
+# (or an unsupported shell) it falls back to printing the line.
 persist_brew_shellenv() {
     brew_bin=$1
     line="eval \"\$($brew_bin shellenv)\""
-    rc=$(shll_rc_file)
+    rc=$(brew_rc_file)
 
     if [ -z "$rc" ]; then
         echo "Homebrew installed. To make brew (and the installed tools) resolvable in future shells,"
-        echo "add this line to your shell rc file:"
+        echo "add this line to your shell startup file:"
         echo "  $line"
         return 0
     fi
+
+    # zsh: `shll setup shell` wires ~/.zshrc but refuses to create it, and a
+    # fresh account often has none — create it empty so the wiring lands.
+    if [ "$(basename "${SHELL:-}")" = zsh ] && [ ! -e "${ZDOTDIR:-$HOME}/.zshrc" ]; then
+        (: >>"${ZDOTDIR:-$HOME}/.zshrc") 2>/dev/null || true
+    fi
+
     if [ -f "$rc" ] && grep -q 'brew shellenv' "$rc"; then
         echo "Homebrew installed; $rc already loads brew shellenv."
         return 0
     fi
 
     comment="# Homebrew (added by the shll installer)"
-    if [ -f "$rc" ] && grep -q -e '^# >>> shll >>>' -e '^# >>> shll shell-init >>>' "$rc"; then
+    blocks='^# >>> (shll|shll shell-init|rk tmux guard) >>>'
+    if [ -f "$rc" ] && grep -Eq "$blocks" "$rc"; then
         # Rewrite through cat > "$rc" (not mv) so a dotfile-manager symlink
         # and the file's permissions survive.
         tmp=$(mktemp) || tmp=""
         if [ -n "$tmp" ] &&
-            awk -v c="$comment" -v l="$line" '
-                !done && /^# >>> shll( shell-init)? >>>/ { print c; print l; print ""; done = 1 }
+            awk -v c="$comment" -v l="$line" -v re="$blocks" '
+                !done && $0 ~ re { print c; print l; print ""; done = 1 }
                 { print }
             ' "$rc" >"$tmp" &&
             (cat "$tmp" >"$rc") 2>/dev/null; then
             rm -f "$tmp"
-            echo "Homebrew installed; added its shellenv line to $rc (above the shll block)."
+            echo "Homebrew installed; added its shellenv line to $rc (above the toolkit blocks)."
             return 0
         fi
         [ -n "$tmp" ] && rm -f "$tmp"
     else
-        # Append (creating the file if absent — `shll setup shell` refuses to
-        # create rc files, so this also unblocks its wiring). Lead with a
-        # newline only when the file doesn't already end in one.
+        # Append, creating the file if absent. Lead with a newline only when
+        # the file doesn't already end in one.
         lead=""
         if [ -s "$rc" ] && [ -n "$(tail -c 1 "$rc")" ]; then
             lead="
@@ -303,7 +329,8 @@ main() {
         # unguarded `eval "$(shll shell-init <shell>)"` into the rc file;
         # without brew's shellenv ahead of it every new shell fails with
         # `command not found: shll`. shll setup shell wires shll's own init,
-        # not brew's, so the installer that put brew there persists it.
+        # not brew's, so the installer that put brew there persists it —
+        # ahead of rk's tmux guard too (see brew_rc_file).
         persist_brew_shellenv "$BREW"
     fi
     phase_done "brew bootstrap"

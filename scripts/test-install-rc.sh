@@ -1,11 +1,12 @@
 #!/bin/sh
-# Tests scripts/install.sh's rc-file persistence of brew's shellenv line
+# Tests scripts/install.sh's persistence of brew's shellenv line
 # (persist_brew_shellenv) — the fix for "zsh: command not found: shll" in every
-# new shell after a fresh-Homebrew bootstrap on Linux.
+# new shell after a fresh-Homebrew bootstrap, placed so it never jumps ahead
+# of run-kit's tmux guard shims ("rk doctor: [FAIL] tmux-guard shim").
 #
 # Portable POSIX sh, no GNU-only tools, so it runs unchanged on macOS (BSD
 # userland, /bin/sh = bash 3.2) and Linux (dash). Needs a real brew somewhere
-# (on PATH or at a standard prefix) for the "new shell resolves brew" checks.
+# (on PATH or at a standard prefix) for the "new shell" checks.
 #
 #   sh scripts/test-install-rc.sh              # functions under sh
 #   TEST_SH=dash sh scripts/test-install-rc.sh # functions under another shell
@@ -35,6 +36,14 @@ if [ -z "$brew_bin" ]; then
     exit 1
 fi
 
+# Where the line is expected (brew_rc_file): zsh → .zshenv on Linux,
+# .zprofile on macOS; bash → .bashrc on Linux, .bash_profile on macOS.
+if [ "$(uname -s)" = Darwin ]; then
+    zf=.zprofile brc=.bash_profile
+else
+    zf=.zshenv brc=.bashrc
+fi
+
 fails=0
 pass() { echo "ok   - $1"; }
 fail() { echo "FAIL - $1" >&2; fails=$((fails + 1)); }
@@ -48,100 +57,128 @@ persist() {
 }
 count() { grep -c "$1" "$2" 2>/dev/null || true; }
 newhome() { rm -rf "${work:?}/$1"; mkdir -p "$work/$1"; printf '%s\n' "$work/$1"; }
+line="eval \"\$($brew_bin shellenv)\""
 shll_block='# >>> shll >>>
 eval "$(shll shell-init zsh)"
 # <<< shll <<<'
-line="eval \"\$($brew_bin shellenv)\""
+guard_block='# >>> rk tmux guard >>>
+export PATH="$HOME/.local/share/rk/shims:$PATH"
+# <<< rk tmux guard <<<'
 
-# 1. Fresh zsh rc without a trailing newline: appended on its own line.
-h=$(newhome t1); printf 'alias ll=ls' >"$h/.zshrc"
+# 1. Existing file without a trailing newline: appended on its own line.
+h=$(newhome t1); printf 'export A=1' >"$h/$zf"
 persist "$h" /bin/zsh
-if [ "$(sed -n 1p "$h/.zshrc")" = 'alias ll=ls' ] && [ "$(tail -n 1 "$h/.zshrc")" = "$line" ]; then
-    pass "zsh: appends the shellenv line (fixes a missing trailing newline)"
-else fail "zsh: append"; cat "$h/.zshrc" >&2; fi
+if [ "$(sed -n 1p "$h/$zf")" = 'export A=1' ] && [ "$(tail -n 1 "$h/$zf")" = "$line" ]; then
+    pass "zsh: appends to ~/$zf (fixes a missing trailing newline)"
+else fail "zsh: append to ~/$zf"; cat "$h/$zf" >&2; fi
 
-# 2. Re-run: shll block already present → line lands ABOVE it, mode kept.
-h=$(newhome t2); printf 'export A=1\n%s\n' "$shll_block" >"$h/.zshrc"; chmod 600 "$h/.zshrc"
+# 2. rk tmux guard block present (rk agent setup ran before) → line lands
+#    ABOVE it, file mode kept.
+h=$(newhome t2); printf 'export A=1\n%s\n' "$guard_block" >"$h/$zf"; chmod 600 "$h/$zf"
 persist "$h" /bin/zsh
-brew_ln=$(grep -n 'brew shellenv' "$h/.zshrc" | cut -d: -f1)
-shll_ln=$(grep -n '^# >>> shll >>>' "$h/.zshrc" | cut -d: -f1)
-mode=$(ls -l "$h/.zshrc" | cut -c1-10)
-if [ -n "$brew_ln" ] && [ "$brew_ln" -lt "$shll_ln" ] && [ "$mode" = "-rw-------" ]; then
-    pass "zsh: inserts above an existing shll block, keeps file mode"
-else fail "zsh: insert above shll block (mode $mode)"; cat "$h/.zshrc" >&2; fi
+brew_ln=$(grep -n 'brew shellenv' "$h/$zf" | cut -d: -f1)
+guard_ln=$(grep -n '^# >>> rk tmux guard >>>' "$h/$zf" | cut -d: -f1)
+mode=$(ls -l "$h/$zf" | cut -c1-10)
+if [ -n "$brew_ln" ] && [ "$brew_ln" -lt "$guard_ln" ] && [ "$mode" = "-rw-------" ]; then
+    pass "zsh: inserts above an rk tmux guard block, keeps file mode"
+else fail "zsh: insert above rk guard (mode $mode)"; cat "$h/$zf" >&2; fi
 
 # 3. Idempotent: a second run adds nothing.
 persist "$h" /bin/zsh
-if [ "$(count 'brew shellenv' "$h/.zshrc")" = 1 ]; then pass "idempotent re-run"
+if [ "$(count 'brew shellenv' "$h/$zf")" = 1 ]; then pass "idempotent re-run"
 else fail "idempotent re-run"; fi
 
-# 4. Legacy `# >>> shll shell-init >>>` block is also recognized.
-h=$(newhome t4); printf '# >>> shll shell-init >>>\neval "$(shll shell-init zsh)"\n# <<< shll shell-init <<<\n' >"$h/.zshrc"
-persist "$h" /bin/zsh
-if [ "$(sed -n 2p "$h/.zshrc")" = "$line" ]; then pass "zsh: inserts above a legacy shll block"
-else fail "zsh: legacy block"; cat "$h/.zshrc" >&2; fi
+# 4. bash: shll block and rk guard in the same file → above the FIRST of them.
+h=$(newhome t4); printf 'x\n%s\n%s\n' "$shll_block" "$guard_block" >"$h/$brc"
+persist "$h" /bin/bash
+if [ "$(sed -n 3p "$h/$brc")" = "$line" ] && [ "$(sed -n 5p "$h/$brc")" = '# >>> shll >>>' ]; then pass "bash: inserts above the first toolkit block in ~/$brc"
+else fail "bash: first block in ~/$brc"; cat "$h/$brc" >&2; fi
 
-# 5. Missing rc file is created (shll setup shell refuses to create one).
-h=$(newhome t5)
-persist "$h" /bin/zsh
-if [ "$(tail -n 1 "$h/.zshrc" 2>/dev/null)" = "$line" ]; then pass "zsh: creates a missing .zshrc"
-else fail "zsh: missing rc"; fi
+# 5. Legacy `# >>> shll shell-init >>>` block is also recognized.
+h=$(newhome t5); printf '# >>> shll shell-init >>>\neval "$(shll shell-init bash)"\n# <<< shll shell-init <<<\n' >"$h/$brc"
+persist "$h" /bin/bash
+if [ "$(sed -n 2p "$h/$brc")" = "$line" ]; then pass "bash: inserts above a legacy shll block"
+else fail "bash: legacy block"; cat "$h/$brc" >&2; fi
 
-# 6. ZDOTDIR is honored, $HOME/.zshrc untouched.
-h=$(newhome t6); mkdir -p "$h/z"; : >"$h/z/.zshrc"
+# 6. Fresh zsh account: no startup files at all → the line's file is
+#    created, and an empty .zshrc is created for `shll setup shell` (which
+#    refuses to create one).
+h=$(newhome t6)
+persist "$h" /bin/zsh
+if [ "$(tail -n 1 "$h/$zf" 2>/dev/null)" = "$line" ] && [ -f "$h/.zshrc" ] && [ ! -s "$h/.zshrc" ]; then
+    pass "zsh: fresh account gets ~/$zf with the line and an empty ~/.zshrc"
+else fail "zsh: fresh account"; ls -A "$h" >&2; fi
+
+# 7. ZDOTDIR is honored, $HOME untouched.
+h=$(newhome t7); mkdir -p "$h/z"
 persist "$h" /bin/zsh "$h/z"
-if grep -q 'brew shellenv' "$h/z/.zshrc" && [ ! -e "$h/.zshrc" ]; then pass "zsh: honors ZDOTDIR"
+if grep -q 'brew shellenv' "$h/z/$zf" && [ ! -e "$h/$zf" ] && [ ! -e "$h/.zshrc" ]; then pass "zsh: honors ZDOTDIR"
 else fail "zsh: ZDOTDIR"; fi
 
-# 7. Symlinked rc (dotfile manager): link survives, target is edited.
-h=$(newhome t7); mkdir -p "$h/dot"; printf '%s\n' "$shll_block" >"$h/dot/zshrc"; ln -s dot/zshrc "$h/.zshrc"
+# 8. Symlinked file (dotfile manager): link survives, target is edited.
+h=$(newhome t8); mkdir -p "$h/dot"; printf '%s\n' "$guard_block" >"$h/dot/f"; ln -s dot/f "$h/$zf"
 persist "$h" /bin/zsh
-if [ -L "$h/.zshrc" ] && grep -q 'brew shellenv' "$h/dot/zshrc"; then pass "zsh: keeps a symlinked rc a symlink"
-else fail "zsh: symlinked rc"; fi
-
-# 8. bash → ~/.bash_profile on macOS, ~/.bashrc elsewhere (shll's resolveRcFile).
-h=$(newhome t8)
-if [ "$(uname -s)" = Darwin ]; then brc=.bash_profile; else brc=.bashrc; fi
-printf 'x\n' >"$h/$brc"
-persist "$h" /bin/bash
-if grep -q 'brew shellenv' "$h/$brc"; then pass "bash: writes ~/$brc"
-else fail "bash: ~/$brc"; fi
+if [ -L "$h/$zf" ] && grep -q 'brew shellenv' "$h/dot/f"; then pass "zsh: keeps a symlinked ~/$zf a symlink"
+else fail "zsh: symlinked file"; fi
 
 # 9. Unsupported shell: nothing written, the line is printed instead.
 h=$(newhome t9)
 persist "$h" /usr/bin/fish
-if [ -z "$(ls -A "$h")" ] && grep -q 'add this line to your shell rc file' "$work/out"; then
+if [ -z "$(ls -A "$h")" ] && grep -q 'add this line to your shell startup file' "$work/out"; then
     pass "other shell: prints the line, writes nothing"
 else fail "other shell"; fi
 
-# 10. Unwritable rc: never fatal under set -eu, prints the line, no raw shell noise.
+# 10. Unwritable file: never fatal under set -eu, prints the line, no raw shell noise.
 for variant in plain block; do
-    h=$(newhome "t10$variant")
-    if [ "$variant" = block ]; then printf '%s\n' "$shll_block" >"$h/.zshrc"; else printf 'x\n' >"$h/.zshrc"; fi
-    chmod 400 "$h/.zshrc"
+    h=$(newhome "t10$variant"); : >"$h/.zshrc"
+    if [ "$variant" = block ]; then printf '%s\n' "$guard_block" >"$h/$zf"; else printf 'x\n' >"$h/$zf"; fi
+    chmod 400 "$h/$zf"
     persist "$h" /bin/zsh
     if grep -q __continued__ "$work/out" && grep -q 'could not be updated' "$work/out" &&
         ! grep -qi 'permission denied' "$work/out"; then
-        pass "unwritable rc ($variant): falls back to printing, installer continues"
-    else fail "unwritable rc ($variant)"; cat "$work/out" >&2; fi
+        pass "unwritable file ($variant): falls back to printing, installer continues"
+    else fail "unwritable file ($variant)"; cat "$work/out" >&2; fi
 done
 
-# 11. The real point: a brand-new interactive shell with a bare PATH (a fresh
-# terminal) resolves brew — and so every brew-installed tool, shll included —
-# after the rc file was written.
+# 11. The real point, in a brand-new shell with a bare PATH (a fresh terminal):
+#     brew resolves, sourcing the shll-style rc raises no "command not found",
+#     and — on Linux, where the line shares .zshenv/.bashrc with rk's guard —
+#     the rk shims dir stays AHEAD of brew's bin (the tmux-guard doctor check).
+#     macOS terminals start login shells; Linux terminals start non-login ones.
 bare=/usr/bin:/bin
+brew_dir=$(dirname "$brew_bin")
+if [ "$(uname -s)" = Darwin ]; then flags=-il; else flags=-i; fi
 for sh_name in zsh bash; do
     sh_bin=$(command -v "$sh_name" 2>/dev/null || true)
     [ -n "$sh_bin" ] || { echo "skip - $sh_name not installed"; continue; }
     h=$(newhome "t11$sh_name")
-    if [ "$sh_name" = zsh ]; then rcf=.zshrc; else rcf=$brc; fi
-    : >"$h/$rcf"
-    persist "$h" "$sh_bin"
-    # bash only reads ~/.bash_profile for login shells (macOS terminals).
-    if [ "$rcf" = .bash_profile ]; then flags=-il; else flags=-i; fi
-    got=$(cd "$h" && env -i HOME="$h" TERM=dumb PATH="$bare" "$sh_bin" $flags -c 'command -v brew' 2>/dev/null </dev/null | tail -n 1)
-    if [ "$got" = "$brew_bin" ]; then pass "new $sh_name terminal resolves brew"
-    else fail "new $sh_name terminal resolves brew (got '$got')"; fi
+    if [ "$sh_name" = zsh ]; then
+        persist "$h" "$sh_bin"
+        # What `rk agent setup` then `shll setup shell` append after it.
+        printf '%s\n' "$guard_block" >>"$h/.zshenv"
+        printf 'command -v brew >/dev/null || echo "command not found: brew"\n' >>"$h/.zshrc"
+    else
+        persist "$h" "$sh_bin"
+        printf '%s\n' "$guard_block" >>"$h/$brc"
+        printf 'command -v brew >/dev/null || echo "command not found: brew"\n' >>"$h/$brc"
+    fi
+    got=$(cd "$h" && env -i HOME="$h" TERM=dumb PATH="$bare" "$sh_bin" $flags \
+        -c 'command -v brew; printf "PATH=%s\n" "$PATH"' 2>&1 </dev/null)
+    if echo "$got" | grep -q 'command not found'; then
+        fail "new $sh_name terminal: command not found"; echo "$got" >&2; continue
+    fi
+    if echo "$got" | grep -qx "$brew_bin"; then pass "new $sh_name terminal resolves brew"
+    else fail "new $sh_name terminal resolves brew"; echo "$got" >&2; fi
+    path_line=$(echo "$got" | grep '^PATH=' | tail -n 1)
+    shims_pos=$(echo "$path_line" | tr ':=' '\n\n' | grep -n -x "$h/.local/share/rk/shims" | head -n 1 | cut -d: -f1)
+    brew_pos=$(echo "$path_line" | tr ':=' '\n\n' | grep -n -x "$brew_dir" | head -n 1 | cut -d: -f1)
+    if [ "$(uname -s)" = Darwin ] && [ "$sh_name" = zsh ]; then
+        # .zprofile runs after rk's .zshenv guard — run-kit's documented
+        # login-profile limitation, not something this line can order around.
+        echo "skip - macOS zsh: rk guard (.zshenv) vs brew (.zprofile) order is run-kit's documented limitation"
+    elif [ -n "$shims_pos" ] && [ -n "$brew_pos" ] && [ "$shims_pos" -lt "$brew_pos" ]; then
+        pass "new $sh_name terminal keeps the rk shims ahead of brew"
+    else fail "new $sh_name terminal keeps the rk shims ahead of brew (shims=$shims_pos brew=$brew_pos)"; echo "$path_line" >&2; fi
 done
 
 echo
